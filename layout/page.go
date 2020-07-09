@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"reflect"
+	"math/bits"
 	"strings"
 
 	"github.com/apache/thrift/lib/go/thrift"
@@ -81,12 +81,14 @@ func TableToDataPages(table *Table, pageSize int32, compressType parquet.Compres
 		var maxVal interface{} = table.Values[i]
 		var minVal interface{} = table.Values[i]
 
+		funcTable := common.FindFuncTable(pT, cT)
+
 		for j < totalLn && size < pageSize {
 			if table.DefinitionLevels[j] == table.MaxDefinitionLevel {
 				numValues++
-				size += int32(common.SizeOf(reflect.ValueOf(table.Values[j])))
-				maxVal = common.Max(maxVal, table.Values[j], pT, cT)
-				minVal = common.Min(minVal, table.Values[j], pT, cT)
+				var elSize int32
+				minVal, maxVal, elSize = funcTable.MinMaxSize(minVal, maxVal, table.Values[j])
+				size += elSize
 			}
 			j++
 		}
@@ -170,7 +172,6 @@ func (page *Page) EncodingValues(valuesBuf []interface{}) []byte {
 	} else {
 		return encoding.WritePlain(valuesBuf, *page.Schema.Type)
 	}
-	return []byte{}
 }
 
 //Compress the data page to parquet file
@@ -178,11 +179,22 @@ func (page *Page) DataPageCompress(compressType parquet.CompressionCodec) []byte
 	ln := len(page.DataTable.DefinitionLevels)
 
 	//values////////////////////////////////////////////
-	valuesBuf := make([]interface{}, 0)
+	// valuesBuf == nil means "up to i, every item in DefinitionLevels was
+	// MaxDefinitionLevel". This lets us avoid allocating the array for the
+	// (somewhat) common case of "all values present".
+	var valuesBuf []interface{}
 	for i := 0; i < ln; i++ {
 		if page.DataTable.DefinitionLevels[i] == page.DataTable.MaxDefinitionLevel {
-			valuesBuf = append(valuesBuf, page.DataTable.Values[i])
+			if valuesBuf != nil {
+				valuesBuf = append(valuesBuf, page.DataTable.Values[i])
+			}
+		} else if valuesBuf == nil {
+			valuesBuf = make([]interface{}, i, ln)
+			copy(valuesBuf[:i], page.DataTable.Values[:i])
 		}
+	}
+	if valuesBuf == nil {
+		valuesBuf = page.DataTable.Values
 	}
 	//valuesRawBuf := encoding.WritePlain(valuesBuf)
 	valuesRawBuf := page.EncodingValues(valuesBuf)
@@ -190,29 +202,21 @@ func (page *Page) DataPageCompress(compressType parquet.CompressionCodec) []byte
 	//definitionLevel//////////////////////////////////
 	var definitionLevelBuf []byte
 	if page.DataTable.MaxDefinitionLevel > 0 {
-		numInterfaces := make([]interface{}, ln)
-		for i := 0; i < ln; i++ {
-			numInterfaces[i] = int64(page.DataTable.DefinitionLevels[i])
-		}
-		definitionLevelBuf = encoding.WriteRLEBitPackedHybrid(numInterfaces,
-			int32(common.BitNum(uint64(page.DataTable.MaxDefinitionLevel))),
-			parquet.Type_INT64)
+		definitionLevelBuf = encoding.WriteRLEBitPackedHybridInt32(
+			page.DataTable.DefinitionLevels,
+			int32(bits.Len32(uint32(page.DataTable.MaxDefinitionLevel))))
 	}
 
 	//repetitionLevel/////////////////////////////////
 	var repetitionLevelBuf []byte
 	if page.DataTable.MaxRepetitionLevel > 0 {
-		numInterfaces := make([]interface{}, ln)
-		for i := 0; i < ln; i++ {
-			numInterfaces[i] = int64(page.DataTable.RepetitionLevels[i])
-		}
-		repetitionLevelBuf = encoding.WriteRLEBitPackedHybrid(numInterfaces,
-			int32(common.BitNum(uint64(page.DataTable.MaxRepetitionLevel))),
-			parquet.Type_INT64)
+		repetitionLevelBuf = encoding.WriteRLEBitPackedHybridInt32(
+			page.DataTable.RepetitionLevels,
+			int32(bits.Len32(uint32(page.DataTable.MaxRepetitionLevel))))
 	}
 
 	//dataBuf = repetitionBuf + definitionBuf + valuesRawBuf
-	var dataBuf []byte
+	dataBuf := make([]byte, 0, len(repetitionLevelBuf) + len(definitionLevelBuf) + len(valuesRawBuf))
 	dataBuf = append(dataBuf, repetitionLevelBuf...)
 	dataBuf = append(dataBuf, definitionLevelBuf...)
 	dataBuf = append(dataBuf, valuesRawBuf...)
@@ -239,6 +243,7 @@ func (page *Page) DataPageCompress(compressType parquet.CompressionCodec) []byte
 			tmpBuf = tmpBuf[4:]
 		}
 		page.Header.DataPageHeader.Statistics.Max = tmpBuf
+		page.Header.DataPageHeader.Statistics.MaxValue = tmpBuf
 	}
 	if page.MinVal != nil {
 		tmpBuf := encoding.WritePlain([]interface{}{page.MinVal}, *page.Schema.Type)
@@ -248,15 +253,14 @@ func (page *Page) DataPageCompress(compressType parquet.CompressionCodec) []byte
 			tmpBuf = tmpBuf[4:]
 		}
 		page.Header.DataPageHeader.Statistics.Min = tmpBuf
+		page.Header.DataPageHeader.Statistics.MinValue = tmpBuf
 	}
 
 	ts := thrift.NewTSerializer()
 	ts.Protocol = thrift.NewTCompactProtocolFactory().GetProtocol(ts.Transport)
 	pageHeaderBuf, _ := ts.Write(context.TODO(), page.Header)
 
-	var res []byte
-	res = append(res, pageHeaderBuf...)
-	res = append(res, dataEncodeBuf...)
+	res := append(pageHeaderBuf, dataEncodeBuf...)
 	page.RawData = res
 
 	return res
@@ -284,7 +288,7 @@ func (page *Page) DataPageV2Compress(compressType parquet.CompressionCodec) []by
 			numInterfaces[i] = int64(page.DataTable.DefinitionLevels[i])
 		}
 		definitionLevelBuf = encoding.WriteRLE(numInterfaces,
-			int32(common.BitNum(uint64(page.DataTable.MaxDefinitionLevel))),
+			int32(bits.Len32(uint32(page.DataTable.MaxDefinitionLevel))),
 			parquet.Type_INT64)
 	}
 
@@ -300,7 +304,7 @@ func (page *Page) DataPageV2Compress(compressType parquet.CompressionCodec) []by
 			}
 		}
 		repetitionLevelBuf = encoding.WriteRLE(numInterfaces,
-			int32(common.BitNum(uint64(page.DataTable.MaxRepetitionLevel))),
+			int32(bits.Len32(uint32(page.DataTable.MaxRepetitionLevel))),
 			parquet.Type_INT64)
 	}
 
@@ -331,6 +335,7 @@ func (page *Page) DataPageV2Compress(compressType parquet.CompressionCodec) []by
 			tmpBuf = tmpBuf[4:]
 		}
 		page.Header.DataPageHeaderV2.Statistics.Max = tmpBuf
+		page.Header.DataPageHeaderV2.Statistics.MaxValue = tmpBuf
 	}
 	if page.MinVal != nil {
 		tmpBuf := encoding.WritePlain([]interface{}{page.MinVal}, *page.Schema.Type)
@@ -340,6 +345,7 @@ func (page *Page) DataPageV2Compress(compressType parquet.CompressionCodec) []by
 			tmpBuf = tmpBuf[4:]
 		}
 		page.Header.DataPageHeaderV2.Statistics.Min = tmpBuf
+		page.Header.DataPageHeaderV2.Statistics.MinValue = tmpBuf
 	}
 
 	ts := thrift.NewTSerializer()
@@ -461,7 +467,7 @@ func (self *Page) GetRLDLFromRawData(schemaHandler *schema.SchemaHandler) (int64
 
 		var repetitionLevels, definitionLevels []interface{}
 		if maxRepetitionLevel > 0 {
-			bitWidth := common.BitNum(uint64(maxRepetitionLevel))
+			bitWidth := uint64(bits.Len32(uint32(maxRepetitionLevel)))
 			if repetitionLevels, err = ReadDataPageValues(bytesReader,
 				parquet.Encoding_RLE,
 				parquet.Type_INT64,
@@ -481,7 +487,7 @@ func (self *Page) GetRLDLFromRawData(schemaHandler *schema.SchemaHandler) (int64
 		}
 
 		if maxDefinitionLevel > 0 {
-			bitWidth := common.BitNum(uint64(maxDefinitionLevel))
+			bitWidth := uint64(bits.Len32(uint32(maxDefinitionLevel)))
 
 			definitionLevels, err = ReadDataPageValues(bytesReader,
 				parquet.Encoding_RLE,
@@ -727,8 +733,10 @@ func ReadPage(thriftReader *thrift.TBufferedTransport, schemaHandler *schema.Sch
 		}
 
 		codec := colMetaData.GetCodec()
-		if dataBuf, err = compress.Uncompress(dataBuf, codec); err != nil {
-			return nil, 0, 0, err
+		if len(dataBuf) > 0 {
+			if dataBuf, err = compress.Uncompress(dataBuf, codec); err != nil {
+				return nil, 0, 0, err
+			}
 		}
 
 		tmpBuf := make([]byte, 0)
@@ -803,7 +811,7 @@ func ReadPage(thriftReader *thrift.TBufferedTransport, schemaHandler *schema.Sch
 
 		var repetitionLevels []interface{}
 		if maxRepetitionLevel > 0 {
-			bitWidth := common.BitNum(uint64(maxRepetitionLevel))
+			bitWidth := uint64(bits.Len32(uint32(maxRepetitionLevel)))
 
 			repetitionLevels, err = ReadDataPageValues(bytesReader,
 				parquet.Encoding_RLE,
@@ -827,7 +835,7 @@ func ReadPage(thriftReader *thrift.TBufferedTransport, schemaHandler *schema.Sch
 
 		var definitionLevels []interface{}
 		if maxDefinitionLevel > 0 {
-			bitWidth := common.BitNum(uint64(maxDefinitionLevel))
+			bitWidth := uint64(bits.Len32(uint32(maxDefinitionLevel)))
 
 			definitionLevels, err = ReadDataPageValues(bytesReader,
 				parquet.Encoding_RLE,

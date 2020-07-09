@@ -39,7 +39,7 @@ type ParquetWriter struct {
 
 	DictRecs map[string]*layout.DictRecType
 
-	MarshalFunc func(src []interface{}, bgn int, end int, sh *schema.SchemaHandler) (*map[string]*layout.Table, error)
+	MarshalFunc func(src []interface{}, sh *schema.SchemaHandler) (*map[string]*layout.Table, error)
 }
 
 //Create a parquet handler. Obj is a object with tags or JSON schema string.
@@ -61,7 +61,7 @@ func NewParquetWriter(pFile source.ParquetFile, obj interface{}, np int64) (*Par
 	res.DictRecs = make(map[string]*layout.DictRecType)
 	res.Footer = parquet.NewFileMetaData()
 	res.Footer.Version = 1
-	//include the createdBy to avoid 
+	//include the createdBy to avoid
 	//WARN  CorruptStatistics:118 - Ignoring statistics because created_by is null or empty! See PARQUET-251 and PARQUET-297
 	createdBy := "parquet-go version latest"
 	res.Footer.CreatedBy = &createdBy
@@ -189,6 +189,8 @@ func (self *ParquetWriter) flushObjs() error {
 	delta := (l + self.NP - 1) / self.NP
 	lock := new(sync.Mutex)
 	var wg sync.WaitGroup
+	var errs []error = make([]error, self.NP)
+
 	for c = 0; c < self.NP; c++ {
 		bgn := c * delta
 		end := bgn + delta
@@ -206,11 +208,11 @@ func (self *ParquetWriter) flushObjs() error {
 				if r := recover(); r != nil {
 					switch x := r.(type) {
 					case string:
-						err = errors.New(x)
+						errs[index] = errors.New(x)
 					case error:
-						err = x
+						errs[index] = x
 					default:
-						err = errors.New("unknown error")
+						errs[index] = errors.New("unknown error")
 					}
 				}
 			}()
@@ -219,19 +221,24 @@ func (self *ParquetWriter) flushObjs() error {
 				return
 			}
 
-			tableMap, err2 := self.MarshalFunc(self.Objs, b, e, self.SchemaHandler)
+			tableMap, err2 := self.MarshalFunc(self.Objs[b:e], self.SchemaHandler)
 
 			if err2 == nil {
 				for name, table := range *tableMap {
 					if table.Info.Encoding == parquet.Encoding_PLAIN_DICTIONARY ||
 						table.Info.Encoding == parquet.Encoding_RLE_DICTIONARY {
-						lock.Lock()
-						if _, ok := self.DictRecs[name]; !ok {
-							self.DictRecs[name] = layout.NewDictRec(*table.Schema.Type)
-						}
-						pagesMapList[index][name], _ = layout.TableToDictDataPages(self.DictRecs[name],
-							table, int32(self.PageSize), 32, self.CompressionType)
-						lock.Unlock()
+
+						func() {
+							if self.NP > 1 {
+								lock.Lock()
+								defer lock.Unlock()
+							}
+							if _, ok := self.DictRecs[name]; !ok {
+								self.DictRecs[name] = layout.NewDictRec(*table.Schema.Type)
+							}
+							pagesMapList[index][name], _ = layout.TableToDictDataPages(self.DictRecs[name],
+								table, int32(self.PageSize), 32, self.CompressionType)
+						}()
 
 					} else {
 						pagesMapList[index][name], _ = layout.TableToDataPages(table, int32(self.PageSize),
@@ -239,13 +246,20 @@ func (self *ParquetWriter) flushObjs() error {
 					}
 				}
 			} else {
-				err = err2
+				errs[index] = err2
 			}
 
 		}(int(bgn), int(end), c)
 	}
 
 	wg.Wait()
+
+	for _, err2 := range errs {
+		if err2 != nil {
+			err = err2
+			break
+		}
+	}
 
 	for _, pagesMap := range pagesMapList {
 		for name, pages := range pagesMap {
